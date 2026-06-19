@@ -1,18 +1,19 @@
 //! Fluent builder for [`SandboxConfig`].
 
+#[cfg(feature = "net")]
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use microsandbox_image::{PullPolicy, PullProgressHandle, RegistryAuth};
+use microsandbox_image::{PullProgressHandle, RegistryAuth};
 #[cfg(feature = "net")]
 use microsandbox_network::builder::{NetworkBuilder, SecretBuilder};
+use microsandbox_types::{EnvVar, PullPolicy};
 #[cfg(feature = "net")]
-use microsandbox_network::config::{PortProtocol, PublishedPort};
-#[cfg(feature = "net")]
-use std::net::{IpAddr, Ipv4Addr};
+use microsandbox_types::{PortProtocol, PublishedPortSpec};
 
 use super::{
-    config::SandboxConfig,
+    config::{SandboxConfig, sandbox_log_level_from_runtime},
     exec::{Rlimit, RlimitResource},
     init::{HandoffInit, InitOptionsBuilder},
     types::{
@@ -74,11 +75,11 @@ impl SandboxBuilder {
     /// The name must be unique among existing sandboxes (unless
     /// [`replace`](Self::replace) is set) and no longer than 128 UTF-8 bytes.
     pub fn new(name: impl Into<String>) -> Self {
+        let mut config = SandboxConfig::default();
+        config.spec.name = name.into();
+
         Self {
-            config: SandboxConfig {
-                name: name.into(),
-                ..Default::default()
-            },
+            config,
             detached: false,
             build_error: None,
             pending_snapshot: None,
@@ -101,7 +102,7 @@ impl SandboxBuilder {
     /// ```
     pub fn image(mut self, image: impl IntoImage) -> Self {
         match image.into_rootfs_source() {
-            Ok(rootfs) => self.config.image = rootfs,
+            Ok(rootfs) => self.config.spec.image = rootfs,
             Err(e) => {
                 if self.build_error.is_none() {
                     self.build_error = Some(e);
@@ -119,7 +120,7 @@ impl SandboxBuilder {
     /// ```
     pub fn image_with(mut self, f: impl FnOnce(ImageBuilder) -> ImageBuilder) -> Self {
         match f(ImageBuilder::new()).build() {
-            Ok(rootfs) => self.config.image = rootfs,
+            Ok(rootfs) => self.config.spec.image = rootfs,
             Err(e) => {
                 if self.build_error.is_none() {
                     self.build_error = Some(e);
@@ -136,7 +137,7 @@ impl SandboxBuilder {
     /// the image reference and its options are parsed separately.
     pub fn oci_upper_size(mut self, size: impl Into<Mebibytes>) -> Self {
         let size_mib = size.into().as_u32();
-        match &mut self.config.image {
+        match &mut self.config.spec.image {
             RootfsSource::Oci(oci) if !oci.reference.is_empty() => {
                 oci.upper_size_mib = Some(size_mib);
             }
@@ -160,7 +161,7 @@ impl SandboxBuilder {
 
     /// Allocate virtual CPUs for this sandbox (default: 1).
     pub fn cpus(mut self, count: u8) -> Self {
-        self.config.cpus = count;
+        self.config.spec.resources.cpus = count;
         self
     }
 
@@ -173,7 +174,7 @@ impl SandboxBuilder {
     /// .memory(1.gib())     // 1 GiB = 1024 MiB
     /// ```
     pub fn memory(mut self, size: impl Into<Mebibytes>) -> Self {
-        self.config.memory_mib = size.into().as_u32();
+        self.config.spec.resources.memory_mib = size.into().as_u32();
         self
     }
 
@@ -181,13 +182,13 @@ impl SandboxBuilder {
     ///
     /// This controls the verbosity of the `msb sandbox` process.
     pub fn log_level(mut self, level: LogLevel) -> Self {
-        self.config.log_level = Some(level);
+        self.config.spec.runtime.log_level = Some(sandbox_log_level_from_runtime(level));
         self
     }
 
     /// Disable runtime logs for this sandbox, even if a global default exists.
     pub fn quiet_logs(mut self) -> Self {
-        self.config.log_level = None;
+        self.config.spec.runtime.log_level = None;
         self
     }
 
@@ -201,7 +202,7 @@ impl SandboxBuilder {
 
     /// Force-disable metrics sampling regardless of `metrics_sample_interval`.
     pub fn disable_metrics_sample(mut self) -> Self {
-        self.config.disable_metrics_sample = true;
+        self.config.spec.runtime.disable_metrics_sample = true;
         self
     }
 
@@ -216,7 +217,8 @@ impl SandboxBuilder {
             }
             return self;
         }
-        self.config.metrics_sample_interval_ms = std::num::NonZero::new(ms as u64);
+        self.config.spec.runtime.metrics_sample_interval_ms =
+            std::num::NonZero::new(ms as u64).map(std::num::NonZero::get);
         self
     }
 
@@ -225,14 +227,14 @@ impl SandboxBuilder {
     /// [`shell`](super::Sandbox::shell), and [`attach`](super::Sandbox::attach)
     /// unless overridden per-command.
     pub fn workdir(mut self, path: impl Into<String>) -> Self {
-        self.config.workdir = Some(path.into());
+        self.config.spec.runtime.workdir = Some(path.into());
         self
     }
 
     /// Shell used by [`shell()`](super::Sandbox::shell) to interpret
     /// commands (default: `/bin/sh`).
     pub fn shell(mut self, shell: impl Into<String>) -> Self {
-        self.config.shell = Some(shell.into());
+        self.config.spec.runtime.shell = Some(shell.into());
         self
     }
 
@@ -302,7 +304,7 @@ impl SandboxBuilder {
 
     /// Override the OCI image entrypoint.
     pub fn entrypoint(mut self, cmd: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.config.entrypoint = Some(cmd.into_iter().map(Into::into).collect());
+        self.config.spec.runtime.entrypoint = Some(cmd.into_iter().map(Into::into).collect());
         self
     }
 
@@ -345,7 +347,7 @@ impl SandboxBuilder {
     /// PID 1; `entrypoint` is the user workload that agentd exec's
     /// per request. They can be combined freely.
     pub fn init(mut self, cmd: impl Into<PathBuf>) -> Self {
-        self.config.init = Some(HandoffInit {
+        self.config.spec.init = Some(HandoffInit {
             cmd: cmd.into(),
             args: Vec::new(),
             env: Vec::new(),
@@ -373,7 +375,7 @@ impl SandboxBuilder {
         f: impl FnOnce(InitOptionsBuilder) -> InitOptionsBuilder,
     ) -> Self {
         let (args, env) = f(InitOptionsBuilder::default()).build();
-        self.config.init = Some(HandoffInit {
+        self.config.spec.init = Some(HandoffInit {
             cmd: cmd.into(),
             args,
             env,
@@ -384,19 +386,19 @@ impl SandboxBuilder {
     /// Set the guest hostname. Limited to 64 UTF-8 bytes (the Linux UTS
     /// limit). Defaults to a sandbox-name-derived form when unset.
     pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
-        self.config.hostname = Some(hostname.into());
+        self.config.spec.runtime.hostname = Some(hostname.into());
         self
     }
 
     /// Set the user identity inside the sandbox (e.g., `"1000"`, `"appuser"`, `"1000:1000"`).
     pub fn user(mut self, user: impl Into<String>) -> Self {
-        self.config.user = Some(user.into());
+        self.config.spec.runtime.user = Some(user.into());
         self
     }
 
     /// Set the pull policy for OCI images.
     pub fn pull_policy(mut self, policy: PullPolicy) -> Self {
-        self.config.pull_policy = policy;
+        self.config.spec.pull_policy = policy;
         self
     }
 
@@ -411,8 +413,22 @@ impl SandboxBuilder {
     /// ```
     #[cfg(feature = "net")]
     pub fn disable_network(mut self) -> Self {
-        self.config.network.enabled = false;
-        self.config.network.policy = microsandbox_network::policy::NetworkPolicy::none();
+        match self.config.local_network_config() {
+            Ok(mut network) => {
+                network.enabled = false;
+                network.policy = microsandbox_network::policy::NetworkPolicy::none();
+                if let Err(err) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+            }
+        }
         self
     }
 
@@ -427,9 +443,23 @@ impl SandboxBuilder {
     /// ```
     #[cfg(feature = "net")]
     pub fn network(mut self, f: impl FnOnce(NetworkBuilder) -> NetworkBuilder) -> Self {
-        let network = std::mem::take(&mut self.config.network);
+        let network = match self.config.local_network_config() {
+            Ok(network) => network,
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+                return self;
+            }
+        };
         match f(NetworkBuilder::from_config(network)).build() {
-            Ok(net) => self.config.network = net,
+            Ok(net) => {
+                if let Err(err) = self.config.set_local_network_config(net)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
             Err(err) => {
                 if self.build_error.is_none() {
                     self.build_error = Some(err.into());
@@ -477,11 +507,11 @@ impl SandboxBuilder {
         guest_port: u16,
         protocol: PortProtocol,
     ) {
-        self.config.network.ports.push(PublishedPort {
+        self.config.spec.network.ports.push(PublishedPortSpec {
             host_port,
             guest_port,
             protocol,
-            host_bind,
+            host_bind: host_bind.to_string(),
         });
     }
 
@@ -536,10 +566,23 @@ impl SandboxBuilder {
         mut self,
         entry: microsandbox_network::secrets::config::SecretEntry,
     ) -> Self {
-        self.config.network.secrets.secrets.push(entry);
-        // Auto-enable TLS when secrets are configured.
-        if !self.config.network.tls.enabled {
-            self.config.network.tls.enabled = true;
+        match self.config.local_network_config() {
+            Ok(mut network) => {
+                network.secrets.secrets.push(entry);
+                if !network.tls.enabled {
+                    network.tls.enabled = true;
+                }
+                if let Err(err) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+            }
         }
         self
     }
@@ -578,7 +621,7 @@ impl SandboxBuilder {
             }
             return self;
         }
-        self.config.env.push((key, value.into()));
+        self.config.spec.env.push(EnvVar::new(key, value));
         self
     }
 
@@ -595,7 +638,7 @@ impl SandboxBuilder {
 
     /// Attach a label (`key`/`value`) to the sandbox for attribution.
     pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.config.labels.insert(key.into(), value.into());
+        self.config.spec.labels.insert(key.into(), value.into());
         self
     }
 
@@ -605,7 +648,7 @@ impl SandboxBuilder {
         labels: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
         for (k, v) in labels {
-            self.config.labels.insert(k.into(), v.into());
+            self.config.spec.labels.insert(k.into(), v.into());
         }
         self
     }
@@ -616,7 +659,7 @@ impl SandboxBuilder {
     /// long-lived daemons inherit the raised baseline without needing explicit
     /// per-exec rlimits.
     pub fn rlimit(mut self, resource: RlimitResource, limit: u64) -> Self {
-        self.config.rlimits.push(Rlimit {
+        self.config.spec.rlimits.push(Rlimit {
             resource,
             soft: limit,
             hard: limit,
@@ -626,7 +669,7 @@ impl SandboxBuilder {
 
     /// Set a sandbox-wide resource limit with different soft/hard values.
     pub fn rlimit_range(mut self, resource: RlimitResource, soft: u64, hard: u64) -> Self {
-        self.config.rlimits.push(Rlimit {
+        self.config.spec.rlimits.push(Rlimit {
             resource,
             soft,
             hard,
@@ -638,7 +681,11 @@ impl SandboxBuilder {
     /// the guest. Scripts are added to `PATH` so they can be invoked by name
     /// via [`exec`](super::Sandbox::exec).
     pub fn script(mut self, name: impl Into<String>, content: impl Into<String>) -> Self {
-        self.config.scripts.insert(name.into(), content.into());
+        self.config
+            .spec
+            .runtime
+            .scripts
+            .insert(name.into(), content.into());
         self
     }
 
@@ -648,27 +695,31 @@ impl SandboxBuilder {
         scripts: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
         for (name, content) in scripts {
-            self.config.scripts.insert(name.into(), content.into());
+            self.config
+                .spec
+                .runtime
+                .scripts
+                .insert(name.into(), content.into());
         }
         self
     }
 
     /// Set a maximum sandbox lifetime in seconds.
     pub fn max_duration(mut self, secs: u64) -> Self {
-        self.config.policy.max_duration_secs = Some(secs);
+        self.config.spec.lifecycle.max_duration_secs = Some(secs);
         self
     }
 
     /// Auto-stop the sandbox after this many seconds of inactivity.
     /// Inactivity is detected via agentd heartbeat. Omit to disable (default).
     pub fn idle_timeout(mut self, secs: u64) -> Self {
-        self.config.policy.idle_timeout_secs = Some(secs);
+        self.config.spec.lifecycle.idle_timeout_secs = Some(secs);
         self
     }
 
     /// Set the in-guest security profile.
     pub fn security(mut self, profile: SecurityProfile) -> Self {
-        self.config.security_profile = profile;
+        self.config.spec.security_profile = profile;
         self
     }
 
@@ -686,7 +737,7 @@ impl SandboxBuilder {
         f: impl FnOnce(MountBuilder) -> MountBuilder,
     ) -> Self {
         match f(MountBuilder::new(guest_path)).build() {
-            Ok(mount) => self.config.mounts.push(mount),
+            Ok(mount) => self.config.spec.mounts.push(mount),
             Err(e) => {
                 if self.build_error.is_none() {
                     self.build_error = Some(e);
@@ -710,13 +761,16 @@ impl SandboxBuilder {
     /// )
     /// ```
     pub fn patch(mut self, f: impl FnOnce(PatchBuilder) -> PatchBuilder) -> Self {
-        self.config.patches.extend(f(PatchBuilder::new()).build());
+        self.config
+            .spec
+            .patches
+            .extend(f(PatchBuilder::new()).build());
         self
     }
 
     /// Add a single patch directly.
     pub fn add_patch(mut self, patch: Patch) -> Self {
-        self.config.patches.push(patch);
+        self.config.spec.patches.push(patch);
         self
     }
 
@@ -782,14 +836,14 @@ impl SandboxBuilder {
         let snap = crate::snapshot::Snapshot::open(&snapshot_ref).await?;
         let snap_ref = snap.manifest().image.reference.clone();
 
-        self.config.image = RootfsSource::oci(snap_ref);
+        self.config.spec.image = RootfsSource::oci(snap_ref);
         self.config.manifest_digest = Some(snap.manifest().image.manifest_digest.clone());
         self.config.snapshot_upper_source = Some(snap.path().join(&snap.manifest().upper.file));
         Ok(())
     }
 
     fn has_explicit_rootfs_source(&self) -> bool {
-        match &self.config.image {
+        match &self.config.spec.image {
             RootfsSource::Oci(oci) => !oci.reference.is_empty() || oci.upper_size_mib.is_some(),
             RootfsSource::Bind(path) => !path.as_os_str().is_empty(),
             RootfsSource::DiskImage { .. } => true,
@@ -895,16 +949,16 @@ impl SandboxBuilder {
             return Err(err);
         }
 
-        if self.config.name.is_empty() {
+        if self.config.spec.name.is_empty() {
             return Err(crate::MicrosandboxError::InvalidConfig(
                 "sandbox name is required".into(),
             ));
         }
-        super::validate_sandbox_name_for_runtime(&self.config.name)?;
-        super::validate_hostname(self.config.hostname.as_deref())?;
+        super::validate_sandbox_name_for_runtime(&self.config.spec.name)?;
+        super::validate_hostname(self.config.spec.runtime.hostname.as_deref())?;
 
         // Check that image is set (non-empty OCI string or Bind path).
-        match &self.config.image {
+        match &self.config.spec.image {
             RootfsSource::Oci(oci) if oci.reference.is_empty() => {
                 return Err(crate::MicrosandboxError::InvalidConfig(
                     "image source is required".into(),
@@ -915,7 +969,7 @@ impl SandboxBuilder {
                     "oci upper_size must be greater than 0".into(),
                 ));
             }
-            RootfsSource::DiskImage { .. } if !self.config.patches.is_empty() => {
+            RootfsSource::DiskImage { .. } if !self.config.spec.patches.is_empty() => {
                 return Err(crate::MicrosandboxError::InvalidConfig(
                     "patches are not compatible with disk image rootfs".into(),
                 ));
@@ -923,7 +977,7 @@ impl SandboxBuilder {
             _ => {}
         }
 
-        for rlimit in &self.config.rlimits {
+        for rlimit in &self.config.spec.rlimits {
             if rlimit.soft > rlimit.hard {
                 return Err(crate::MicrosandboxError::InvalidConfig(format!(
                     "rlimit {}: soft ({}) must not exceed hard ({})",
@@ -934,18 +988,22 @@ impl SandboxBuilder {
             }
         }
 
-        super::types::validate_volume_mounts(&self.config.mounts)?;
-        super::validate_env(&self.config.env)?;
-        super::validate_labels(&self.config.labels)?;
+        super::types::validate_volume_mounts(&self.config.spec.mounts)?;
+        super::validate_env(&self.config.spec.env)?;
+        super::validate_labels(&self.config.spec.labels)?;
 
-        if let Some(spec) = &self.config.init {
+        if let Some(spec) = &self.config.spec.init {
             super::init::validate(spec)?;
         }
 
         #[cfg(feature = "net")]
-        self.config.network.secrets.validate().map_err(|err| {
-            crate::MicrosandboxError::InvalidConfig(format!("invalid network secrets: {err}"))
-        })?;
+        self.config
+            .local_network_config()?
+            .secrets
+            .validate()
+            .map_err(|err| {
+                crate::MicrosandboxError::InvalidConfig(format!("invalid network secrets: {err}"))
+            })?;
 
         // Reject any two DiskImage mounts pointing at the same host file.
         // Each virtio-blk device caches independently on the host, so any
@@ -956,7 +1014,7 @@ impl SandboxBuilder {
         // canonical path so symlinks and `./` prefixes don't bypass the
         // check.
         let mut seen: Vec<PathBuf> = Vec::new();
-        for mount in &self.config.mounts {
+        for mount in &self.config.spec.mounts {
             if let VolumeMount::DiskImage { host, .. } = mount {
                 let canonical = std::fs::canonicalize(host).map_err(|e| {
                     crate::MicrosandboxError::InvalidConfig(format!(
@@ -1004,9 +1062,10 @@ mod tests {
     use crate::backend::{LocalBackend, with_backend};
     use crate::sandbox::{MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, RlimitResource};
     #[cfg(feature = "net")]
-    use microsandbox_network::config::PortProtocol;
-    #[cfg(feature = "net")]
     use microsandbox_network::secrets::config::{HostPattern, SecretEntry, SecretInjection};
+    #[cfg(feature = "net")]
+    use microsandbox_types::PortProtocol;
+    use microsandbox_types::SandboxLogLevel;
     #[cfg(feature = "net")]
     use std::net::{IpAddr, Ipv4Addr};
     use tempfile::Builder as TempDirBuilder;
@@ -1020,7 +1079,33 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(config.log_level, Some(LogLevel::Debug));
+        assert_eq!(config.spec.runtime.log_level, Some(SandboxLogLevel::Debug));
+    }
+
+    #[tokio::test]
+    async fn test_builder_builds_config_with_shared_spec() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .cpus(2)
+            .memory(1024)
+            .log_level(LogLevel::Info)
+            .env("A", "B")
+            .script("setup", "echo hi")
+            .max_duration(60)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.name, "test");
+        assert_eq!(config.spec.resources.cpus, 2);
+        assert_eq!(config.spec.resources.memory_mib, 1024);
+        assert_eq!(config.spec.runtime.log_level, Some(SandboxLogLevel::Info));
+        assert_eq!(config.spec.env.len(), 1);
+        assert_eq!(
+            config.spec.runtime.scripts.get("setup"),
+            Some(&"echo hi".into())
+        );
+        assert_eq!(config.spec.lifecycle.max_duration_secs, Some(60));
     }
 
     #[cfg(unix)]
@@ -1045,7 +1130,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(config.name, name);
+        assert_eq!(config.spec.name, name);
     }
 
     #[tokio::test]
@@ -1073,7 +1158,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(config.hostname.as_deref(), Some(hostname.as_str()));
+        assert_eq!(
+            config.spec.runtime.hostname.as_deref(),
+            Some(hostname.as_str())
+        );
     }
 
     #[tokio::test]
@@ -1114,7 +1202,7 @@ mod tests {
             .await
             .unwrap();
 
-        match config.image {
+        match &config.spec.image {
             super::RootfsSource::Oci(oci) => {
                 assert_eq!(oci.reference, "alpine");
                 assert_eq!(oci.upper_size_mib, Some(8192));
@@ -1131,7 +1219,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(config.image.oci_upper_size_mib(), None);
+        assert_eq!(config.spec.image.oci_upper_size_mib(), None);
     }
 
     #[tokio::test]
@@ -1216,7 +1304,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(config.log_level, None);
+        assert_eq!(config.spec.runtime.log_level, None);
     }
 
     #[tokio::test]
@@ -1228,10 +1316,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            config.metrics_sample_interval_ms,
-            std::num::NonZero::new(750)
-        );
+        assert_eq!(config.spec.runtime.metrics_sample_interval_ms, Some(750));
     }
 
     #[tokio::test]
@@ -1243,7 +1328,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(config.metrics_sample_interval_ms.is_none());
+        assert!(config.spec.runtime.metrics_sample_interval_ms.is_none());
         assert!(config.effective_metrics_interval().is_none());
     }
 
@@ -1257,11 +1342,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(config.disable_metrics_sample);
-        assert_eq!(
-            config.metrics_sample_interval_ms,
-            std::num::NonZero::new(5000)
-        );
+        assert!(config.spec.runtime.disable_metrics_sample);
+        assert_eq!(config.spec.runtime.metrics_sample_interval_ms, Some(5000));
         assert!(config.effective_metrics_interval().is_none());
     }
 
@@ -1286,10 +1368,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(config.rlimits.len(), 1);
-        assert_eq!(config.rlimits[0].resource, RlimitResource::Nofile);
-        assert_eq!(config.rlimits[0].soft, 65_535);
-        assert_eq!(config.rlimits[0].hard, 65_535);
+        assert_eq!(config.spec.rlimits.len(), 1);
+        assert_eq!(config.spec.rlimits[0].resource, RlimitResource::Nofile);
+        assert_eq!(config.spec.rlimits[0].soft, 65_535);
+        assert_eq!(config.spec.rlimits[0].hard, 65_535);
     }
 
     #[cfg(feature = "net")]
@@ -1307,28 +1389,28 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(config.network.ports.len(), 5);
-        assert_eq!(config.network.ports[0].host_port, 8080);
-        assert_eq!(config.network.ports[0].guest_port, 80);
-        assert_eq!(config.network.ports[0].protocol, PortProtocol::Tcp);
+        assert_eq!(config.spec.network.ports.len(), 5);
+        assert_eq!(config.spec.network.ports[0].host_port, 8080);
+        assert_eq!(config.spec.network.ports[0].guest_port, 80);
+        assert_eq!(config.spec.network.ports[0].protocol, PortProtocol::Tcp);
         assert_eq!(
-            config.network.ports[0].host_bind,
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
+            config.spec.network.ports[0].host_bind,
+            IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()
         );
-        assert_eq!(config.network.ports[1].host_port, 3000);
-        assert_eq!(config.network.ports[1].guest_port, 3000);
-        assert_eq!(config.network.ports[1].protocol, PortProtocol::Tcp);
-        assert_eq!(config.network.ports[2].host_port, 5353);
-        assert_eq!(config.network.ports[2].guest_port, 53);
-        assert_eq!(config.network.ports[2].protocol, PortProtocol::Udp);
-        assert_eq!(config.network.ports[3].host_bind, bind);
-        assert_eq!(config.network.ports[3].host_port, 8081);
-        assert_eq!(config.network.ports[3].guest_port, 81);
-        assert_eq!(config.network.ports[3].protocol, PortProtocol::Tcp);
-        assert_eq!(config.network.ports[4].host_bind, bind);
-        assert_eq!(config.network.ports[4].host_port, 5354);
-        assert_eq!(config.network.ports[4].guest_port, 54);
-        assert_eq!(config.network.ports[4].protocol, PortProtocol::Udp);
+        assert_eq!(config.spec.network.ports[1].host_port, 3000);
+        assert_eq!(config.spec.network.ports[1].guest_port, 3000);
+        assert_eq!(config.spec.network.ports[1].protocol, PortProtocol::Tcp);
+        assert_eq!(config.spec.network.ports[2].host_port, 5353);
+        assert_eq!(config.spec.network.ports[2].guest_port, 53);
+        assert_eq!(config.spec.network.ports[2].protocol, PortProtocol::Udp);
+        assert_eq!(config.spec.network.ports[3].host_bind, bind.to_string());
+        assert_eq!(config.spec.network.ports[3].host_port, 8081);
+        assert_eq!(config.spec.network.ports[3].guest_port, 81);
+        assert_eq!(config.spec.network.ports[3].protocol, PortProtocol::Tcp);
+        assert_eq!(config.spec.network.ports[4].host_bind, bind.to_string());
+        assert_eq!(config.spec.network.ports[4].host_port, 5354);
+        assert_eq!(config.spec.network.ports[4].guest_port, 54);
+        assert_eq!(config.spec.network.ports[4].protocol, PortProtocol::Udp);
     }
 
     #[cfg(feature = "net")]
@@ -1343,12 +1425,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!config.network.enabled);
+        let network = config.local_network_config().unwrap();
+        assert!(!network.enabled);
         // `disable_network()` uses `NetworkPolicy::none()` which is deny-all
         // in both directions with no rules.
-        assert_eq!(config.network.policy.default_egress, Action::Deny);
-        assert_eq!(config.network.policy.default_ingress, Action::Deny);
-        assert!(config.network.policy.rules.is_empty());
+        assert_eq!(network.policy.default_egress, Action::Deny);
+        assert_eq!(network.policy.default_ingress, Action::Deny);
+        assert!(network.policy.rules.is_empty());
     }
 
     #[cfg(feature = "net")]
@@ -1363,12 +1446,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(config.network.ports.len(), 1);
-        assert_eq!(config.network.ports[0].host_port, 8080);
-        assert_eq!(config.network.ports[0].guest_port, 80);
-        assert_eq!(config.network.ports[0].protocol, PortProtocol::Tcp);
-        assert_eq!(config.network.secrets.secrets.len(), 1);
-        assert_eq!(config.network.max_connections, Some(128));
+        assert_eq!(config.spec.network.ports.len(), 1);
+        assert_eq!(config.spec.network.ports[0].host_port, 8080);
+        assert_eq!(config.spec.network.ports[0].guest_port, 80);
+        assert_eq!(config.spec.network.ports[0].protocol, PortProtocol::Tcp);
+        let network = config.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets.len(), 1);
+        assert_eq!(network.max_connections, Some(128));
     }
 
     #[cfg(feature = "net")]

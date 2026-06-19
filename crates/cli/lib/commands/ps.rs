@@ -171,7 +171,7 @@ fn format_ports(config: &SandboxConfig) -> String {
 }
 
 fn extract_image_raw(config: &SandboxConfig) -> String {
-    match &config.image {
+    match &config.spec.image {
         microsandbox::sandbox::RootfsSource::Oci(oci) => oci.reference.clone(),
         microsandbox::sandbox::RootfsSource::Bind(p) => p.display().to_string(),
         microsandbox::sandbox::RootfsSource::DiskImage { path, .. } => path.display().to_string(),
@@ -181,10 +181,10 @@ fn extract_image_raw(config: &SandboxConfig) -> String {
 fn format_command_raw(config: &SandboxConfig) -> String {
     let mut parts = Vec::new();
 
-    if let Some(entrypoint) = &config.entrypoint {
+    if let Some(entrypoint) = &config.spec.runtime.entrypoint {
         parts.extend(entrypoint.iter().cloned());
     }
-    if let Some(cmd) = &config.cmd {
+    if let Some(cmd) = &config.spec.runtime.cmd {
         parts.extend(cmd.iter().cloned());
     }
 
@@ -198,18 +198,18 @@ fn format_command_raw(config: &SandboxConfig) -> String {
 fn format_ports_raw(config: &SandboxConfig) -> Vec<String> {
     #[cfg(feature = "net")]
     {
-        if !config.network.enabled || config.network.ports.is_empty() {
+        let network = &config.spec.network;
+        if !network.enabled || network.ports.is_empty() {
             return Vec::new();
         }
 
-        config
-            .network
+        network
             .ports
             .iter()
             .map(|port| {
                 let protocol = match port.protocol {
-                    microsandbox_network::config::PortProtocol::Tcp => "tcp",
-                    microsandbox_network::config::PortProtocol::Udp => "udp",
+                    microsandbox::sandbox::PortProtocol::Tcp => "tcp",
+                    microsandbox::sandbox::PortProtocol::Udp => "udp",
                 };
                 format!(
                     "{}:{}->{}/{}",

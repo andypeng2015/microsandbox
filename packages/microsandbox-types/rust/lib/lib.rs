@@ -18,8 +18,12 @@ pub use cloud::{
     CloudPaginated, CloudSandbox, CloudSandboxStatus,
 };
 pub use domain::{
-    DiskImageFormat, HostPermissions, LogSource, MountOptions, OciRootfsSource, Rlimit,
-    RlimitResource, RootfsSource, SandboxPolicy, SecurityProfile, StatVirtualization,
+    DEFAULT_METRICS_SAMPLE_INTERVAL_MS, DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB,
+    DiskImageFormat, EnvVar, HandoffInit, HostPermissions, LogSource, MountOptions,
+    NamedVolumeCreate, NamedVolumeMode, NetworkSpec, OciRootfsSource, Patch, PortProtocol,
+    PublishedPortSpec, PullPolicy, Rlimit, RlimitResource, RootfsSource, SandboxLogLevel,
+    SandboxPolicy, SandboxResources, SandboxRuntimeOptions, SandboxSpec, SecurityProfile,
+    SnapshotDestination, SnapshotSpec, StatVirtualization, VolumeKind, VolumeMount, VolumeSpec,
 };
 pub use error::{TypesError, TypesResult};
 pub use validation::{
