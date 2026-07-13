@@ -3676,6 +3676,7 @@ dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
  "serde_json",
+ "tempfile",
  "tokio",
  "typed-path",
 ]
